@@ -2,360 +2,392 @@ from __future__ import annotations
 import os
 import time
 import threading
-import streamlit as st
 from datetime import datetime
+import streamlit as st
 
-# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="ClipMaster Pro",
     page_icon="🎬",
     layout="wide",
 )
 
-# ── Imports ───────────────────────────────────────────────────────────────────
 from utils.clipper import download_video, generate_clips
-from utils.poster import (
-    generate_caption_with_claude,
-    post_to_twitter,
-    post_to_instagram_basic,
-    post_to_tiktok_manual,
-)
+from utils.poster  import post_to_platform
+from utils.ai_engine import generate_caption, generate_content_strategy
 
-# ── Directories ───────────────────────────────────────────────────────────────
-os.makedirs("downloads", exist_ok=True)
-os.makedirs("clips", exist_ok=True)
+# ── Dirs ──────────────────────────────────────────────────────────────────────
+for d in ["downloads", "clips"]:
+    os.makedirs(d, exist_ok=True)
 
 # ── Session state ─────────────────────────────────────────────────────────────
-for key, val in {
-    "video_path": None,
-    "video_title": "",
-    "clips": [],
-    "captions": {},
-    "post_log": [],
-    "auto_running": False,
-    "download_done": False,
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
+DEFAULTS = {
+    "video_path":    None,
+    "video_title":   "",
+    "clips":         [],
+    "captions":      {},
+    "post_log":      [],
+    "auto_running":  False,
+    "ready":         False,
+    "strategy":      "",
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+ALL_PLATFORMS = [
+    "Twitter/X", "Instagram", "TikTok",
+    "Facebook", "LinkedIn", "YouTube Shorts", "Reddit",
+]
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+html,body,[class*="css"]{font-family:'Inter',sans-serif;}
+.hero{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);
+      border-radius:16px;padding:2rem 2.5rem;margin-bottom:1.5rem;
+      border:1px solid #7c3aed44;}
+.hero h1{font-size:2.2rem;font-weight:700;margin:0;
+         background:linear-gradient(135deg,#a78bfa,#60a5fa,#f472b6);
+         -webkit-background-clip:text;-webkit-text-fill-color:transparent;}
+.hero p{color:#94a3b8;margin:.3rem 0 0;font-size:1rem;}
+.card{background:#1a1a2e;border:1px solid #2d2d4a;border-radius:12px;
+      padding:1.25rem 1.5rem;margin-bottom:.75rem;}
+.log-ok{color:#10b981;} .log-err{color:#ef4444;}
+section[data-testid="stSidebar"]{background:#0d0d1a;border-right:1px solid #1a1a2e;}
+</style>
+""", unsafe_allow_html=True)
 
 # ═════════════════════════════════════════════════════
-# SIDEBAR — credentials
+# SIDEBAR
 # ═════════════════════════════════════════════════════
 with st.sidebar:
-    st.title("🔑 Credentials")
+    st.markdown("## ⚙️ Configuration")
 
-    st.markdown("**Anthropic (for captions)**")
-    anthropic_key = st.text_input(
-        "Claude API Key", type="password",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
-    )
+    # ── AI Keys ───────────────────────────────────────
+    with st.expander("🤖 AI Keys", expanded=True):
+        st.caption("Get Gemini free at aistudio.google.com")
+        gemini_key = st.text_input(
+            "Gemini API Key (free)",
+            type="password",
+            value=os.getenv("GEMINI_API_KEY", ""),
+        )
+        st.caption("Get Groq free at console.groq.com")
+        groq_key = st.text_input(
+            "Groq API Key (free fallback)",
+            type="password",
+            value=os.getenv("GROQ_API_KEY", ""),
+        )
 
+    # ── Social credentials ─────────────────────────────
+    with st.expander("📱 Twitter / X"):
+        tw_key     = st.text_input("API Key",       type="password", key="twk")
+        tw_secret  = st.text_input("API Secret",    type="password", key="tws")
+        tw_token   = st.text_input("Access Token",  type="password", key="twt")
+        tw_tsecret = st.text_input("Access Secret", type="password", key="twts")
+
+    with st.expander("📘 Facebook"):
+        fb_token   = st.text_input("Page Token",   type="password", key="fbt")
+        fb_page_id = st.text_input("Page ID",                        key="fbp")
+
+    with st.expander("💼 LinkedIn"):
+        li_token = st.text_input("Access Token", type="password", key="lit")
+        li_urn   = st.text_input("Person URN",   placeholder="urn:li:person:XXX")
+
+    with st.expander("▶️ YouTube Shorts"):
+        yt_secrets = st.text_input(
+            "client_secrets.json path",
+            placeholder="/path/to/client_secrets.json",
+        )
+
+    with st.expander("📸 Instagram"):
+        ig_token   = st.text_input("Access Token",   type="password", key="igt")
+        ig_user_id = st.text_input("Instagram User ID")
+
+    with st.expander("🤖 Reddit"):
+        reddit_client_id     = st.text_input("Client ID",     key="rci")
+        reddit_client_secret = st.text_input("Client Secret", type="password", key="rcs")
+        reddit_username      = st.text_input("Username",      key="ru")
+        reddit_password      = st.text_input("Password",      type="password", key="rp")
+        reddit_subreddit     = st.text_input("Subreddit",     value="videos", key="rs")
+
+    # ── Post settings ──────────────────────────────────
     st.markdown("---")
-    st.markdown("**Twitter / X**")
-    tw_key    = st.text_input("API Key",          type="password")
-    tw_secret = st.text_input("API Secret",       type="password")
-    tw_token  = st.text_input("Access Token",     type="password")
-    tw_tsecret= st.text_input("Access Secret",    type="password")
-
-    st.markdown("---")
-    st.markdown("**Instagram (Graph API)**")
-    ig_token   = st.text_input("Access Token",    type="password", key="ig_tok")
-    ig_user_id = st.text_input("Instagram User ID")
-
-    st.markdown("---")
-    st.markdown("**Post Settings**")
-    post_interval = st.slider(
-        "Minutes between posts", 1, 60, 10,
-        help="How long to wait between each clip post",
-    )
-    platforms_to_post = st.multiselect(
-        "Post to",
-        ["Twitter/X", "Instagram", "TikTok"],
+    st.markdown("### 🚀 Post Settings")
+    platforms_selected = st.multiselect(
+        "Active platforms",
+        ALL_PLATFORMS,
         default=["Twitter/X"],
     )
+    post_interval = st.slider("Minutes between posts", 1, 120, 15)
+    add_watermark = st.toggle("Add watermark to clips", value=False)
 
     st.markdown("---")
-    if st.session_state.post_log:
-        st.markdown(f"**Posts sent:** {len(st.session_state.post_log)}")
+    st.metric("Clips ready",   len(st.session_state.clips))
+    st.metric("Posts sent",    len(st.session_state.post_log))
+    if st.session_state.auto_running:
+        st.success("🟢 Auto-posting active")
+
+# Bundle credentials
+creds = {
+    "tw_key": tw_key,         "tw_secret": tw_secret,
+    "tw_token": tw_token,     "tw_tsecret": tw_tsecret,
+    "fb_token": fb_token,     "fb_page_id": fb_page_id,
+    "li_token": li_token,     "li_urn": li_urn,
+    "yt_secrets": yt_secrets,
+    "ig_token": ig_token,     "ig_user_id": ig_user_id,
+    "reddit_client_id": reddit_client_id,
+    "reddit_client_secret": reddit_client_secret,
+    "reddit_username": reddit_username,
+    "reddit_password": reddit_password,
+    "reddit_subreddit": reddit_subreddit,
+}
 
 # ═════════════════════════════════════════════════════
-# HEADER
+# HERO
 # ═════════════════════════════════════════════════════
-st.markdown(
-    """
-    <div style="background:linear-gradient(135deg,#1a0a2e,#0f172a);
-                border:1px solid #7c3aed44; border-radius:14px;
-                padding:1.5rem 2rem; margin-bottom:1.5rem;">
-        <h1 style="margin:0; background:linear-gradient(135deg,#a78bfa,#60a5fa);
-                   -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-                   font-size:2rem;">
-            🎬 ClipMaster Pro
-        </h1>
-        <p style="color:#94a3b8; margin:0.3rem 0 0;">
-            Download → Clip → Caption → Post · Fully autonomous
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("""
+<div class="hero">
+  <h1>🎬 ClipMaster Pro</h1>
+  <p>Autonomous video clip generator · AI captions · Multi-platform publisher</p>
+</div>
+""", unsafe_allow_html=True)
 
 # ═════════════════════════════════════════════════════
 # TABS
 # ═════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📥 Download", "✂️ Generate Clips", "📤 Post", "📋 Log"]
-)
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📥 Download",
+    "✂️ Generate Clips",
+    "📤 Publish",
+    "📈 Strategy",
+    "📋 Log",
+])
 
-# ══════════════════════════════
+# ════════════════════════
 # TAB 1 — DOWNLOAD
-# ══════════════════════════════
+# ════════════════════════
 with tab1:
-    st.markdown("### Step 1 — Get your video")
+    st.markdown("### Step 1 — Download your show or video")
 
-    platform_choice = st.radio(
-        "Platform",
-        ["Tubi TV", "Pluto TV", "Other URL"],
+    st.info(
+        "**Supported:** Tubi TV · Pluto TV · YouTube · Dailymotion · Most public video URLs\n\n"
+        "⚠️ DRM-protected streams (Netflix, Disney+, Hulu) cannot be downloaded.",
+        icon="ℹ️",
+    )
+
+    source = st.radio(
+        "Source platform",
+        ["Tubi TV", "Pluto TV", "YouTube", "Direct MP4 URL", "Other"],
         horizontal=True,
     )
 
-    if platform_choice == "Tubi TV":
-        st.info("Go to **tubitv.com**, find a show, copy the URL from your browser.")
-        example = "https://tubitv.com/movies/000000/show-name"
-    elif platform_choice == "Pluto TV":
-        st.info("Go to **pluto.tv**, start playing a channel, copy the URL.")
-        example = "https://pluto.tv/live-tv/channel-name"
-    else:
-        example = "https://..."
-
-    video_url = st.text_input("Video / Show URL", placeholder=example)
-    video_title_input = st.text_input(
-        "Short title for this content",
-        placeholder='e.g. "Breaking Bad S01E01"',
+    examples = {
+        "Tubi TV":        "https://tubitv.com/movies/000000/show-name",
+        "Pluto TV":       "https://pluto.tv/live-tv/channel-name",
+        "YouTube":        "https://youtube.com/watch?v=XXXXXXXXXXX",
+        "Direct MP4 URL": "https://example.com/video.mp4",
+        "Other":          "https://...",
+    }
+    video_url = st.text_input("Video URL", placeholder=examples[source])
+    title_input = st.text_input(
+        "Content title",
+        placeholder='e.g. "The Office S02E05" or "ESPN Highlights"',
     )
 
-    col1, col2 = st.columns(2)
-    max_duration = col1.slider("Max download duration (min)", 5, 60, 20)
-    num_clips    = col2.slider("Number of clips to generate", 7, 10, 8)
-    clip_length  = col1.slider("Clip length (seconds)", 30, 90, 60)
+    c1, c2, c3 = st.columns(3)
+    num_clips    = c1.slider("Clips to generate",    7, 10, 8)
+    clip_length  = c2.slider("Clip length (sec)",   30, 90, 60)
 
-    if st.button("⬇️ Download Video", type="primary", disabled=not video_url):
-        prog = st.progress(0, "Starting download...")
-        status = st.empty()
+    if st.button("⬇️ Download Now", type="primary", disabled=not video_url):
+        with st.spinner("Downloading... please wait."):
+            path = download_video(video_url)
 
-        with st.spinner("Downloading — this may take a few minutes..."):
-            prog.progress(10, "Connecting to platform...")
-            path = download_video(video_url, "downloads")
-
-        if path:
+        if path and os.path.exists(path):
             st.session_state.video_path  = path
-            st.session_state.video_title = video_title_input or os.path.basename(path)
-            st.session_state.download_done = True
-            st.session_state.clips = []
-            st.session_state.captions = {}
-            prog.progress(100, "Download complete!")
-            st.success(f"✅ Downloaded: `{os.path.basename(path)}`")
-            st.info(f"File size: {os.path.getsize(path) / 1e6:.1f} MB")
+            st.session_state.video_title = title_input or os.path.basename(path)
+            st.session_state.ready       = True
+            st.session_state.clips       = []
+            st.session_state.captions    = {}
+            size_mb = os.path.getsize(path) / 1e6
+            st.success(f"✅ Downloaded! `{os.path.basename(path)}` ({size_mb:.1f} MB)")
         else:
-            prog.empty()
             st.error(
-                "❌ Download failed. This usually means:\n"
-                "- The platform requires login / DRM protection\n"
-                "- The URL is incorrect\n"
-                "- The content is geo-restricted\n\n"
-                "**Try:** Right-click the video → Copy video address, or use a direct mp4 URL."
+                "❌ Download failed.\n\n"
+                "**Try these fixes:**\n"
+                "- Make sure the URL is the actual video page URL\n"
+                "- Try a YouTube video first to confirm it works\n"
+                "- Tubi/Pluto may require the full episode URL from your browser\n"
+                "- Some content uses DRM and cannot be downloaded"
             )
 
-    if st.session_state.video_path and os.path.exists(st.session_state.video_path):
+    if st.session_state.video_path:
         st.markdown("---")
-        st.success(f"**Ready:** `{st.session_state.video_title}`")
-        st.caption(
-            f"Path: `{st.session_state.video_path}` · "
-            f"Size: {os.path.getsize(st.session_state.video_path)/1e6:.1f} MB"
-        )
+        st.success(f"**Loaded:** {st.session_state.video_title}")
 
-# ══════════════════════════════
+# ════════════════════════
 # TAB 2 — GENERATE CLIPS
-# ══════════════════════════════
+# ════════════════════════
 with tab2:
-    st.markdown("### Step 2 — Generate clips")
+    st.markdown("### Step 2 — Generate & caption your clips")
 
-    if not st.session_state.download_done or not st.session_state.video_path:
+    if not st.session_state.ready:
         st.info("👈 Download a video in Tab 1 first.")
     else:
         st.success(f"Source: **{st.session_state.video_title}**")
 
-        if st.button("⚡ Generate Clips + Captions", type="primary"):
-            progress_bar = st.progress(0)
-            status_box   = st.empty()
+        col_a, col_b = st.columns(2)
+        num_clips_tab2   = col_a.slider("Number of clips", 7, 10, 8,  key="nc2")
+        clip_length_tab2 = col_b.slider("Clip length (s)", 30, 90, 60, key="cl2")
 
-            def update_progress(pct: float, msg: str):
-                progress_bar.progress(pct, msg)
-                status_box.info(msg)
+        if st.button("⚡ Generate Clips + AI Captions", type="primary"):
+            prog   = st.progress(0.0)
+            status = st.empty()
+
+            def cb(pct, msg):
+                prog.progress(pct, msg)
+                status.info(f"**{msg}**")
 
             clips = generate_clips(
                 st.session_state.video_path,
-                num_clips=num_clips,
-                clip_duration=clip_length,
-                progress_callback=update_progress,
+                num_clips=num_clips_tab2,
+                clip_duration=clip_length_tab2,
+                watermark=add_watermark,
+                progress_callback=cb,
             )
 
             if not clips:
-                st.error("No clips generated. The video may be too short or corrupted.")
+                st.error("No clips generated. Video may be too short or corrupted.")
             else:
                 st.session_state.clips = clips
-                status_box.info("Generating captions with Claude...")
+                status.info("Generating AI captions...")
 
                 captions = {}
-                for i, clip_path in enumerate(clips):
-                    for platform in (platforms_to_post or ["Twitter/X"]):
-                        cap = generate_caption_with_claude(
+                for i, _ in enumerate(clips):
+                    for platform in (platforms_selected or ["Twitter/X"]):
+                        key = f"{i}_{platform}"
+                        captions[key] = generate_caption(
                             clip_number=i + 1,
                             source_title=st.session_state.video_title,
                             platform=platform,
-                            api_key=anthropic_key,
+                            gemini_key=gemini_key,
+                            groq_key=groq_key,
                         )
-                        captions[f"{i}_{platform}"] = cap
 
                 st.session_state.captions = captions
-                progress_bar.progress(1.0, "All clips ready!")
+                prog.progress(1.0, "All clips and captions ready!")
                 st.success(f"✅ {len(clips)} clips generated!")
+                st.balloons()
 
-        # ── Preview clips ──────────────────────────────────────────────────
+        # Preview
         if st.session_state.clips:
-            st.markdown(f"#### 📹 {len(st.session_state.clips)} Clips Ready")
-            cols = st.columns(min(len(st.session_state.clips), 3))
-
+            st.markdown(f"#### 📹 {len(st.session_state.clips)} Clips")
+            cols = st.columns(3)
             for i, clip_path in enumerate(st.session_state.clips):
                 if not os.path.exists(clip_path):
                     continue
                 with cols[i % 3]:
                     st.video(clip_path)
                     st.caption(f"**Clip #{i+1}**")
-
-                    for platform in (platforms_to_post or ["Twitter/X"]):
+                    for platform in (platforms_selected or ["Twitter/X"]):
                         cap_key = f"{i}_{platform}"
                         if cap_key in st.session_state.captions:
-                            with st.expander(f"Caption — {platform}"):
+                            with st.expander(f"✏️ {platform} caption"):
                                 edited = st.text_area(
-                                    "Edit caption",
+                                    "Caption",
                                     value=st.session_state.captions[cap_key],
-                                    key=f"cap_{cap_key}",
-                                    height=120,
+                                    key=f"edit_{cap_key}",
+                                    height=110,
                                     label_visibility="collapsed",
                                 )
                                 st.session_state.captions[cap_key] = edited
 
-# ══════════════════════════════
-# TAB 3 — POST
-# ══════════════════════════════
+# ════════════════════════
+# TAB 3 — PUBLISH
+# ════════════════════════
 with tab3:
-    st.markdown("### Step 3 — Post to social media")
+    st.markdown("### Step 3 — Publish")
 
     if not st.session_state.clips:
         st.info("👈 Generate clips in Tab 2 first.")
     else:
         st.markdown(
-            f"**{len(st.session_state.clips)} clips** ready to post to: "
-            f"`{'  ·  '.join(platforms_to_post or ['None selected'])}`"
-        )
-        st.caption(
-            f"Interval between posts: **{post_interval} minutes** · "
-            f"Total time: ~{len(st.session_state.clips) * post_interval} minutes"
+            f"**{len(st.session_state.clips)} clips** · "
+            f"**{len(platforms_selected)} platforms** · "
+            f"**{post_interval} min interval**"
         )
 
-        col_a, col_b = st.columns(2)
+        col1, col2 = st.columns(2)
 
-        # ── Post all at once ───────────────────────────────────────────────
-        if col_a.button(
-            "🚀 Post All Now",
-            type="primary",
-            use_container_width=True,
-            disabled=not platforms_to_post,
-        ):
-            total = len(st.session_state.clips) * len(platforms_to_post)
-            prog  = st.progress(0)
+        # Post all immediately
+        if col1.button("🚀 Post All Now", type="primary", use_container_width=True):
+            total = len(st.session_state.clips) * len(platforms_selected)
+            prog  = st.progress(0.0)
             done  = 0
 
             for i, clip_path in enumerate(st.session_state.clips):
                 if not os.path.exists(clip_path):
                     continue
-
-                for platform in platforms_to_post:
+                for platform in platforms_selected:
                     cap_key = f"{i}_{platform}"
                     caption = st.session_state.captions.get(
                         cap_key,
-                        f"Clip #{i+1} from {st.session_state.video_title} 🎬 #Viral #FYP",
+                        f"Clip #{i+1} — {st.session_state.video_title} 🎬 #Viral #FYP",
                     )
-
-                    result = _post_single(
-                        platform, clip_path, caption,
-                        tw_key, tw_secret, tw_token, tw_tsecret,
-                        ig_token, ig_user_id,
-                    )
-
-                    log_entry = {
-                        "time": datetime.now().strftime("%H:%M:%S"),
-                        "clip": f"Clip #{i+1}",
+                    result = post_to_platform(platform, caption, clip_path, creds)
+                    st.session_state.post_log.append({
+                        "time":     datetime.now().strftime("%H:%M:%S"),
+                        "clip":     f"Clip #{i+1}",
                         "platform": platform,
-                        "success": result.get("success", False),
-                        "url": result.get("url", ""),
-                        "error": result.get("error", ""),
-                    }
-                    st.session_state.post_log.append(log_entry)
-
+                        "success":  result.get("success", False),
+                        "url":      result.get("url", ""),
+                        "error":    result.get("error", ""),
+                    })
                     done += 1
                     prog.progress(done / total, f"Posted {done}/{total}")
 
-            st.success("✅ All clips posted!")
+            st.success("✅ All done! Check the Log tab.")
             st.rerun()
 
-        # ── Auto-post with interval ────────────────────────────────────────
-        if col_b.button(
-            "⏱️ Auto-Post (with interval)",
+        # Auto-post with interval
+        if col2.button(
+            "⏱️ Auto-Post (interval)",
             use_container_width=True,
-            disabled=not platforms_to_post or st.session_state.auto_running,
+            disabled=st.session_state.auto_running,
         ):
             st.session_state.auto_running = True
 
-            def auto_post_thread():
-                clips   = st.session_state.clips
+            def _auto():
+                clips = st.session_state.clips[:]
                 for i, clip_path in enumerate(clips):
                     if not st.session_state.auto_running:
                         break
                     if not os.path.exists(clip_path):
                         continue
-
-                    for platform in platforms_to_post:
+                    for platform in platforms_selected:
                         cap_key = f"{i}_{platform}"
                         caption = st.session_state.captions.get(
                             cap_key,
-                            f"Clip #{i+1} 🎬 #Viral #FYP",
+                            f"Clip #{i+1} — {st.session_state.video_title} 🎬 #Viral #FYP",
                         )
-                        result = _post_single(
-                            platform, clip_path, caption,
-                            tw_key, tw_secret, tw_token, tw_tsecret,
-                            ig_token, ig_user_id,
-                        )
+                        result = post_to_platform(platform, caption, clip_path, creds)
                         st.session_state.post_log.append({
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "clip": f"Clip #{i+1}",
+                            "time":     datetime.now().strftime("%H:%M:%S"),
+                            "clip":     f"Clip #{i+1}",
                             "platform": platform,
-                            "success": result.get("success", False),
-                            "url": result.get("url", ""),
-                            "error": result.get("error", ""),
+                            "success":  result.get("success", False),
+                            "url":      result.get("url", ""),
+                            "error":    result.get("error", ""),
                         })
-
-                    # Wait interval before next clip
                     if i < len(clips) - 1:
                         time.sleep(post_interval * 60)
 
                 st.session_state.auto_running = False
 
-            t = threading.Thread(target=auto_post_thread, daemon=True)
-            t.start()
+            threading.Thread(target=_auto, daemon=True).start()
             st.success(
-                f"⏱️ Auto-posting started! {len(st.session_state.clips)} clips "
-                f"every {post_interval} min. Check the Log tab."
+                f"⏱️ Auto-posting {len(st.session_state.clips)} clips "
+                f"every {post_interval} min. Check Log tab for progress."
             )
 
         if st.session_state.auto_running:
@@ -363,48 +395,62 @@ with tab3:
                 st.session_state.auto_running = False
                 st.warning("Auto-post stopped.")
 
-# ══════════════════════════════
-# TAB 4 — LOG
-# ══════════════════════════════
+# ════════════════════════
+# TAB 4 — STRATEGY
+# ════════════════════════
 with tab4:
+    st.markdown("### 📈 AI Content Strategy")
+    st.caption("Powered by Gemini / Groq — add a free API key in the sidebar.")
+
+    if st.button("🧠 Generate Strategy", type="primary"):
+        with st.spinner("Generating strategy..."):
+            st.session_state.strategy = generate_content_strategy(
+                source_title=st.session_state.video_title or "your content",
+                num_clips=len(st.session_state.clips) or 8,
+                platforms=platforms_selected or ALL_PLATFORMS,
+                gemini_key=gemini_key,
+                groq_key=groq_key,
+            )
+
+    if st.session_state.strategy:
+        st.markdown(st.session_state.strategy)
+        st.download_button(
+            "⬇️ Download Strategy",
+            st.session_state.strategy,
+            "strategy.md",
+            use_container_width=True,
+        )
+
+# ════════════════════════
+# TAB 5 — LOG
+# ════════════════════════
+with tab5:
     st.markdown("### 📋 Post Log")
 
     if not st.session_state.post_log:
         st.info("No posts yet.")
     else:
+        success_count = sum(1 for e in st.session_state.post_log if e["success"])
+        fail_count    = len(st.session_state.post_log) - success_count
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Posted", len(st.session_state.post_log))
+        m2.metric("✅ Success",   success_count)
+        m3.metric("❌ Failed",    fail_count)
+
+        st.markdown("---")
         for entry in reversed(st.session_state.post_log):
             icon = "✅" if entry["success"] else "❌"
-            line = f"{icon} `{entry['time']}` — **{entry['clip']}** → {entry['platform']}"
+            line = (
+                f"{icon} `{entry['time']}` · **{entry['clip']}** → "
+                f"**{entry['platform']}**"
+            )
             if entry["success"] and entry.get("url"):
-                line += f" — [View]({entry['url']})"
+                line += f" · [View post]({entry['url']})"
             elif not entry["success"]:
-                line += f" — `{entry.get('error', 'Unknown error')}`"
+                line += f" · `{entry.get('error', '')}`"
             st.markdown(line)
 
         if st.button("🗑️ Clear Log"):
             st.session_state.post_log = []
             st.rerun()
-
-# ═════════════════════════════════════════════════════
-# HELPER — single platform post (defined after tabs
-# so it's available in the module scope)
-# ═════════════════════════════════════════════════════
-def _post_single(
-    platform: str,
-    clip_path: str,
-    caption: str,
-    tw_key: str, tw_secret: str, tw_token: str, tw_tsecret: str,
-    ig_token: str, ig_user_id: str,
-) -> dict:
-    if platform == "Twitter/X":
-        return post_to_twitter(
-            caption, clip_path,
-            tw_key, tw_secret, tw_token, tw_tsecret,
-        )
-    elif platform == "Instagram":
-        return post_to_instagram_basic(
-            caption, clip_path, ig_token, ig_user_id,
-        )
-    elif platform == "TikTok":
-        return post_to_tiktok_manual(caption, clip_path)
-    return {"success": False, "error": f"Unknown platform: {platform}"}
