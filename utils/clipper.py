@@ -1,125 +1,101 @@
 from __future__ import annotations
 import os
+import json
 import time
 import subprocess
-import json
-from typing import Optional
+from typing import Optional, Callable
 import numpy as np
 
 
 def download_video(url: str, out_dir: str = "downloads") -> Optional[str]:
-    """Download video from Tubi/Pluto using yt-dlp. Returns file path or None."""
     os.makedirs(out_dir, exist_ok=True)
-    out_template = os.path.join(out_dir, "%(title).50s.%(ext)s")
 
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--merge-output-format", "mp4",
         "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "-o", out_template,
-        "--print", "filename",
+        "-o", os.path.join(out_dir, "%(title).60s.%(ext)s"),
+        "--no-warnings",
         url,
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            return None
-        # Find the downloaded file
-        for line in result.stdout.strip().split("\n"):
-            if line.endswith(".mp4") and os.path.exists(line):
-                return line
-        # Fallback: find newest mp4 in out_dir
-        files = [
-            os.path.join(out_dir, f)
-            for f in os.listdir(out_dir)
-            if f.endswith(".mp4")
-        ]
-        if files:
-            return max(files, key=os.path.getmtime)
-        return None
+        subprocess.run(cmd, timeout=600, check=True)
+        files = sorted(
+            [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".mp4")],
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        return files[0] if files else None
     except Exception as e:
         print(f"Download error: {e}")
         return None
 
 
-def get_video_duration(path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "quiet",
-        "-print_format", "json",
-        "-show_format", path,
-    ]
+def get_duration(path: str) -> float:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
+        cmd = [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return float(json.loads(r.stdout)["format"]["duration"])
     except Exception:
         return 0.0
 
 
-def detect_highlight_times(
-    video_path: str,
+def detect_highlights(
+    path: str,
     num_clips: int = 8,
-    sample_every: int = 60,
+    min_gap: int = 65,
 ) -> list[float]:
-    """
-    Detect scene changes to find highlight start times.
-    Returns list of timestamps in seconds.
-    """
     import cv2
 
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / fps
+    duration = get_duration(path)
 
-    scores = {}
+    scores: dict[float, float] = {}
     prev_gray = None
     frame_idx = 0
-    sample_interval = int(fps * sample_every)
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        if frame_idx % max(1, int(fps)) == 0:  # check every second
+        if frame_idx % int(fps) == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             if prev_gray is not None:
                 diff = cv2.absdiff(gray, prev_gray)
-                score = float(np.mean(diff))
-                timestamp = frame_idx / fps
-                scores[timestamp] = score
+                ts = frame_idx / fps
+                scores[ts] = float(np.mean(diff))
             prev_gray = gray
         frame_idx += 1
-
     cap.release()
 
     if not scores:
-        # Fallback: evenly spaced
         step = max(1, duration / (num_clips + 1))
-        return [step * i for i in range(1, num_clips + 1)]
+        return [round(step * i, 1) for i in range(1, num_clips + 1)]
 
-    # Sort by score descending, pick top timestamps
-    sorted_times = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     highlights = []
-    min_gap = 60  # minimum seconds between clips
 
-    for ts, _ in sorted_times:
+    for ts, _ in ranked:
         if len(highlights) >= num_clips:
             break
-        # Ensure clips don't overlap
-        too_close = any(abs(ts - h) < min_gap for h in highlights)
-        if not too_close and ts < duration - 60:
-            highlights.append(ts)
+        if ts > duration - 65:
+            continue
+        if not any(abs(ts - h) < min_gap for h in highlights):
+            highlights.append(round(ts, 1))
 
-    # If not enough highlights, fill with evenly spaced
+    # Fill gaps with evenly spaced if needed
     if len(highlights) < num_clips:
         step = duration / (num_clips + 1)
         for i in range(1, num_clips + 1):
-            t = step * i
-            if t < duration - 60 and not any(abs(t - h) < min_gap for h in highlights):
+            t = round(step * i, 1)
+            if t < duration - 65 and not any(abs(t - h) < min_gap for h in highlights):
                 highlights.append(t)
             if len(highlights) >= num_clips:
                 break
@@ -127,34 +103,62 @@ def detect_highlight_times(
     return sorted(highlights[:num_clips])
 
 
+def add_watermark(
+    in_path: str,
+    out_path: str,
+    text: str = "🎬 ClipMaster",
+) -> str:
+    """Add subtle text watermark using ffmpeg drawtext."""
+    cmd = [
+        "ffmpeg", "-y", "-i", in_path,
+        "-vf", (
+            f"drawtext=text='{text}':fontsize=24:fontcolor=white@0.5:"
+            "x=10:y=10:shadowcolor=black@0.5:shadowx=2:shadowy=2"
+        ),
+        "-c:a", "copy",
+        "-preset", "fast",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+        return out_path
+    except Exception:
+        return in_path  # return original if watermark fails
+
+
 def cut_clip(
-    video_path: str,
+    path: str,
     start: float,
-    duration: float = 60,
+    duration: int = 60,
     out_path: str = "",
+    add_fade: bool = True,
 ) -> Optional[str]:
-    """Cut a clip using ffmpeg. Returns output path or None."""
+    os.makedirs("clips", exist_ok=True)
     if not out_path:
-        os.makedirs("clips", exist_ok=True)
         out_path = f"clips/clip_{int(start)}_{int(time.time())}.mp4"
+
+    # Build filter for fade in/out
+    vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
+    if add_fade:
+        vf += f",fade=t=in:st=0:d=0.5,fade=t=out:st={duration-1}:d=0.5"
 
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
-        "-i", video_path,
+        "-i", path,
         "-t", str(duration),
+        "-vf", vf,
         "-c:v", "libx264",
         "-c:a", "aac",
         "-preset", "fast",
+        "-crf", "23",
         "-movflags", "+faststart",
         out_path,
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        if result.returncode == 0 and os.path.exists(out_path):
-            return out_path
-        return None
+        subprocess.run(cmd, capture_output=True, timeout=180, check=True)
+        return out_path if os.path.exists(out_path) else None
     except Exception as e:
         print(f"Cut error: {e}")
         return None
@@ -164,35 +168,43 @@ def generate_clips(
     video_path: str,
     num_clips: int = 8,
     clip_duration: int = 60,
-    progress_callback=None,
+    watermark: bool = True,
+    progress_callback: Optional[Callable] = None,
 ) -> list[str]:
-    """
-    Main function: detect highlights and cut clips.
-    Returns list of clip file paths.
-    """
     os.makedirs("clips", exist_ok=True)
-    duration = get_video_duration(video_path)
+    duration = get_duration(video_path)
 
-    if duration < clip_duration:
+    if duration < clip_duration + 10:
         return []
 
     if progress_callback:
-        progress_callback(0.1, "Analyzing video for highlights...")
+        progress_callback(0.05, "Scanning video for best moments...")
 
-    highlight_times = detect_highlight_times(video_path, num_clips)
+    highlights = detect_highlights(video_path, num_clips)
 
     clips = []
-    for i, start in enumerate(highlight_times):
+    for i, start in enumerate(highlights):
         if progress_callback:
-            pct = 0.1 + (0.85 * (i / len(highlight_times)))
-            progress_callback(pct, f"Cutting clip {i+1}/{len(highlight_times)}...")
+            pct = 0.05 + 0.85 * (i / len(highlights))
+            progress_callback(pct, f"Cutting clip {i+1} of {len(highlights)}...")
 
-        out_path = f"clips/clip_{i+1}_{int(time.time())}.mp4"
-        result = cut_clip(video_path, start, clip_duration, out_path)
+        raw_path  = f"clips/raw_{i+1}_{int(time.time())}.mp4"
+        final_path = f"clips/clip_{i+1}_{int(time.time())}.mp4"
+
+        result = cut_clip(video_path, start, clip_duration, raw_path)
+
         if result:
-            clips.append(result)
+            if watermark:
+                final = add_watermark(raw_path, final_path)
+                # Clean up raw
+                if os.path.exists(raw_path) and raw_path != final:
+                    os.remove(raw_path)
+            else:
+                final = raw_path
+            if final and os.path.exists(final):
+                clips.append(final)
 
     if progress_callback:
-        progress_callback(1.0, "Done!")
+        progress_callback(1.0, f"Done! {len(clips)} clips ready.")
 
     return clips
